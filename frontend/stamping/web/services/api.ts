@@ -35,6 +35,35 @@ export interface UserData {
   token?: string;
 }
 
+export interface DocumentVerificationPayload {
+  id: string;
+  file_hash: string;
+  issued_at: string;
+  normalization_strategy: string;
+  zk_commitment: string;
+  checksum: string;
+  signature: string;
+  qr_payload: string;
+  qr_png_base64: string;
+}
+
+export interface SchnorrProof {
+  rx: string;
+  ry: string;
+  s: string;
+}
+
+export interface ProofVerificationResponse {
+  status: string;
+  document_id: string;
+  verified_at: string;
+}
+
+export interface ProofVerificationRequest {
+  proof: SchnorrProof;
+  context?: string;
+}
+
 // Authentication API functions
 export const authAPI = {
   // Register company
@@ -85,3 +114,13 @@ export const userAPI = {
     return response;
   },
 }; 
+
+export const documentAPI = {
+  async getVerification(documentId: string) {
+    return fetchWrapper.get<DocumentVerificationPayload>(`/document/${documentId}/verification`);
+  },
+
+  async verifyProof(documentId: string, payload: ProofVerificationRequest) {
+    return fetchWrapper.post<ProofVerificationResponse>(`/document/${documentId}/zk-verify`, payload);
+  },
+};

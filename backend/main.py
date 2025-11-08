@@ -7,10 +7,16 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import (
-    CompanyRegistration, CompanyResponse,
-    UserRegistration, UserResponse,
-    LoginLogRegistration, UserLogin,
-    DocumentMetadata, DocumentResponse
+    CompanyRegistration,
+    CompanyResponse,
+    UserRegistration,
+    UserResponse,
+    LoginLogRegistration,
+    UserLogin,
+    DocumentMetadata,
+    DocumentResponse,
+    DocumentVerificationPayload,
+    ProofVerificationRequest,
 )
 import os
 from dotenv import load_dotenv
@@ -24,6 +30,12 @@ import json
 import random
 import string
 import re  # For better matching of document ID formats
+from typing import List, Optional
+
+from services.text_processing import extract_text, normalize_text, hash_normalized_text
+from services.zk_proof import commitment_from_hash, verify_schnorr_proof
+from services.qr_payload import generate_qr_png_base64
+from services.signature import sign_payload, verify_signature
 
 load_dotenv()
 
@@ -274,23 +286,121 @@ async def login_user(credentials: UserLogin):
             detail=str(e)
         )
 
+NORMALIZATION_STRATEGY = "unicode_nfkc_lowercase_whitespace_collapse"
+
+
+def isoformat_utc(dt: datetime) -> str:
+    return dt.replace(microsecond=0).isoformat() + "Z"
+
+
+def load_documents() -> List[dict]:
+    if not os.path.exists(DOCUMENTS_METADATA_FILE):
+        return []
+    try:
+        with open(DOCUMENTS_METADATA_FILE, "r") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return []
+
+
+def save_documents(documents: List[dict]) -> None:
+    with open(DOCUMENTS_METADATA_FILE, "w") as f:
+        json.dump(documents, f, indent=2)
+
+
+def find_document(document_id: str) -> Optional[dict]:
+    clean_id = re.sub(r"[^a-zA-Z0-9-]", "", document_id).upper()
+    for document in load_documents():
+        doc_id = document.get("id", "")
+        if doc_id == document_id or doc_id.upper() == clean_id:
+            return document
+    return None
+
+
+def build_verification_payload(document: dict) -> DocumentVerificationPayload:
+    if not document.get("zk_commitment"):
+        raise ValueError("Document does not have a zero-knowledge commitment.")
+
+    issued_at = document.get("timestamp")
+    if not issued_at:
+        issued_at = isoformat_utc(datetime.utcnow())
+    file_hash = document.get("file_hash")
+    normalization_strategy = document.get("normalization_strategy", NORMALIZATION_STRATEGY)
+    zk_commitment = document["zk_commitment"]
+
+    checksum = document.get("checksum")
+    if not checksum:
+        checksum_seed = f"{document['id']}:{zk_commitment}:{file_hash}"
+        checksum = hashlib.sha256(checksum_seed.encode("utf-8")).hexdigest()[:12].upper()
+
+    signable = {
+        "id": document["id"],
+        "file_hash": file_hash,
+        "issued_at": issued_at,
+        "normalization_strategy": normalization_strategy,
+        "zk_commitment": zk_commitment,
+        "checksum": checksum,
+    }
+
+    signature = document.get("signature")
+    if not signature or not verify_signature(signable, signature):
+        signature = sign_payload(signable)
+
+    qr_payload = document.get("qr_payload")
+    qr_png_base64 = document.get("qr_png_base64")
+    if not qr_payload or not qr_png_base64:
+        qr_png_base64, qr_payload = generate_qr_png_base64({**signable, "signature": signature})
+
+    updated_fields = {
+        "normalization_strategy": normalization_strategy,
+        "timestamp": issued_at,
+        "checksum": checksum,
+        "signature": signature,
+        "qr_payload": qr_payload,
+        "qr_png_base64": qr_png_base64,
+    }
+
+    persistence_needed = any(document.get(key) != value for key, value in updated_fields.items())
+    if persistence_needed:
+        documents = load_documents()
+        for idx, doc in enumerate(documents):
+            if doc.get("id") == document["id"]:
+                documents[idx].update(updated_fields)
+                document.update(updated_fields)
+                save_documents(documents)
+                break
+
+    return DocumentVerificationPayload(
+        id=document["id"],
+        file_hash=file_hash,
+        issued_at=issued_at,
+        normalization_strategy=normalization_strategy,
+        zk_commitment=zk_commitment,
+        checksum=checksum,
+        signature=signature,
+        qr_payload=qr_payload,
+        qr_png_base64=qr_png_base64,
+    )
+
+
 @app.post("/upload", response_model=DocumentResponse)
 async def upload_file(file: UploadFile = File(...), user=Depends(verify_token)):
     try:
         print(f"Received file upload: {file.filename}")
-        
+
         # Allow any file type (for submission deadline)
         # if not file.filename.lower().endswith('.pdf'):
         #     raise HTTPException(
         #         status_code=status.HTTP_400_BAD_REQUEST,
         #         detail="Only PDF files are allowed"
         #     )
-        
+
         # Create a unique filename
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        unique_filename = f"{timestamp}_{uuid.uuid4()}_{file.filename}"
+        issued_at = datetime.utcnow()
+        timestamp_token = issued_at.strftime("%Y%m%d%H%M%S")
+        unique_filename = f"{timestamp_token}_{uuid.uuid4()}_{file.filename}"
         file_path = UPLOAD_DIR / unique_filename
-        
+
         # Save the file in chunks to handle large files
         try:
             with open(file_path, "wb") as buffer:
@@ -311,7 +421,7 @@ async def upload_file(file: UploadFile = File(...), user=Depends(verify_token)):
                     content = b"Placeholder file due to upload error"
             except:
                 pass
-        
+
         # Calculate SHA256 hash of the file
         try:
             if 'content' in locals():
@@ -321,12 +431,12 @@ async def upload_file(file: UploadFile = File(...), user=Depends(verify_token)):
         except Exception as e:
             print(f"Error calculating hash: {str(e)}")
             sha256_hash = f"error-{uuid.uuid4()}"
-        
+
         # Generate INV-XXXX-XXXX format ID
         first_part = ''.join(random.choices(string.digits, k=4))
         second_part = ''.join(random.choices(string.digits, k=4))
         doc_id = f"INV-{first_part}-{second_part}"
-        
+
         # Get file size in human-readable format
         try:
             file_size_bytes = os.path.getsize(file_path)
@@ -339,7 +449,40 @@ async def upload_file(file: UploadFile = File(...), user=Depends(verify_token)):
         except Exception as e:
             print(f"Error getting file size: {str(e)}")
             file_size = "Unknown"
-        
+
+        normalization_strategy = NORMALIZATION_STRATEGY
+        normalized_text_hash: Optional[str] = None
+        zk_commitment: Optional[str] = None
+        checksum: Optional[str] = None
+        signature: Optional[str] = None
+        qr_payload: Optional[str] = None
+        qr_png_base64: Optional[str] = None
+
+        try:
+            extracted_text = extract_text(file_path)
+            normalized_text = normalize_text(extracted_text)
+            normalized_text_hash = hash_normalized_text(normalized_text)
+
+            if normalized_text_hash:
+                zk_commitment = commitment_from_hash(normalized_text_hash)
+                verification_payload = {
+                    "id": doc_id,
+                    "file_hash": sha256_hash,
+                    "issued_at": isoformat_utc(issued_at),
+                    "normalization_strategy": normalization_strategy,
+                    "zk_commitment": zk_commitment,
+                }
+                checksum_seed = f"{doc_id}:{zk_commitment}:{sha256_hash}"
+                checksum = hashlib.sha256(checksum_seed.encode("utf-8")).hexdigest()[:12].upper()
+                verification_payload["checksum"] = checksum
+                signature = sign_payload(verification_payload)
+                verification_payload["signature"] = signature
+                qr_png_base64, qr_payload = generate_qr_png_base64(verification_payload)
+            else:
+                print(f"No normalized text hash generated for document {doc_id}")
+        except Exception as exc:
+            print(f"Error generating verification artefacts: {exc}")
+
         # Create document metadata
         try:
             doc_metadata = DocumentMetadata(
@@ -351,43 +494,41 @@ async def upload_file(file: UploadFile = File(...), user=Depends(verify_token)):
                 user_id=uuid.UUID(user["id"]),
                 user_email=user["email"],
                 user_name=user.get("full_name") or user.get("name"),
-                timestamp=datetime.now(),
+                timestamp=issued_at,
                 status="active",
-                size=file_size
+                size=file_size,
+                normalization_strategy=normalization_strategy,
+                normalized_text_hash=normalized_text_hash,
+                zk_commitment=zk_commitment,
+                checksum=checksum,
+                signature=signature,
+                qr_payload=qr_payload,
+                qr_png_base64=qr_png_base64,
             )
-            
-            # Read existing metadata
-            documents = []
-            if os.path.exists(DOCUMENTS_METADATA_FILE):
-                with open(DOCUMENTS_METADATA_FILE, "r") as f:
-                    try:
-                        documents = json.load(f)
-                    except json.JSONDecodeError:
-                        documents = []
-            
+
             # Convert datetime to string for JSON serialization
             doc_dict = doc_metadata.dict()
-            doc_dict["timestamp"] = doc_metadata.timestamp.isoformat()
+            doc_dict["timestamp"] = isoformat_utc(doc_metadata.timestamp)
             doc_dict["user_id"] = str(doc_metadata.user_id)
-            
+
             # Add new document
+            documents = load_documents()
             documents.append(doc_dict)
-            
-            # Save updated metadata
-            with open(DOCUMENTS_METADATA_FILE, "w") as f:
-                json.dump(documents, f, indent=2)
+            save_documents(documents)
         except Exception as e:
             print(f"Error creating/saving metadata: {str(e)}")
-        
+
         print(f"File saved to {file_path} with ID {doc_id}")
         return DocumentResponse(
             id=doc_id,
             name=f"{doc_id}.pdf",
             file_hash=sha256_hash,
             user_id=uuid.UUID(user["id"]),
-            timestamp=datetime.now().isoformat(),
+            timestamp=isoformat_utc(issued_at),
             status="active",
-            size=file_size
+            size=file_size,
+            zk_commitment=zk_commitment,
+            checksum=checksum,
         )
     except Exception as e:
         print(f"Critical error in upload handler: {str(e)}")
@@ -409,15 +550,7 @@ async def get_user_documents(user=Depends(verify_token)):
         print(f"Getting documents for user {user['id']}")
         
         # Read documents metadata
-        documents = []
-        if os.path.exists(DOCUMENTS_METADATA_FILE):
-            with open(DOCUMENTS_METADATA_FILE, "r") as f:
-                try:
-                    all_documents = json.load(f)
-                    # Filter documents by user ID
-                    documents = [doc for doc in all_documents if doc["user_id"] == user["id"]]
-                except json.JSONDecodeError:
-                    documents = []
+        documents = [doc for doc in load_documents() if doc.get("user_id") == user["id"]]
         
         print(f"Found {len(documents)} documents for user {user['id']}")
         return documents
@@ -432,33 +565,7 @@ async def get_user_documents(user=Depends(verify_token)):
 async def get_document_by_id(document_id: str):
     try:
         print(f"Getting document with ID: {document_id}")
-        
-        if not os.path.exists(DOCUMENTS_METADATA_FILE):
-            print(f"Documents file not found: {DOCUMENTS_METADATA_FILE}")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Document not found"
-            )
-        
-        # Read all documents from the metadata file
-        with open(DOCUMENTS_METADATA_FILE, "r") as f:
-            try:
-                all_documents = json.load(f)
-            except json.JSONDecodeError as e:
-                print(f"Error parsing documents metadata: {e}")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Error parsing documents metadata"
-                )
-        
-        # Clean up and standardize document_id format
-        clean_id = re.sub(r'[^a-zA-Z0-9-]', '', document_id).upper()
-        
-        # Try both exact match and case-insensitive match
-        document = next((doc for doc in all_documents if doc["id"] == document_id), None)
-        if not document:
-            document = next((doc for doc in all_documents if doc["id"].upper() == clean_id), None)
-        
+        document = find_document(document_id)
         if not document:
             print(f"Document not found with ID: {document_id}")
             raise HTTPException(
@@ -475,4 +582,72 @@ async def get_document_by_id(document_id: str):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
+        )
+
+
+@app.get("/document/{document_id}/verification", response_model=DocumentVerificationPayload)
+async def get_document_verification(document_id: str):
+    try:
+        document = find_document(document_id)
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found",
+            )
+        payload = build_verification_payload(document)
+        return payload
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
+    except Exception as e:
+        print(f"Error generating verification payload for {document_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )
+
+
+@app.post("/document/{document_id}/zk-verify")
+async def verify_document_proof(document_id: str, request: ProofVerificationRequest):
+    try:
+        document = find_document(document_id)
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found",
+            )
+
+        payload = build_verification_payload(document)
+        proof_payload = request.proof.dict()
+        context = request.context or ""
+
+        is_valid = verify_schnorr_proof(
+            payload.zk_commitment,
+            payload.id,
+            proof_payload,
+            context,
+        )
+
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or mismatched proof.",
+            )
+
+        return {
+            "status": "valid",
+            "document_id": payload.id,
+            "verified_at": isoformat_utc(datetime.utcnow()),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error verifying proof for {document_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
         )

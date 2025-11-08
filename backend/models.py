@@ -58,6 +58,13 @@ class DocumentMetadata(BaseModel):
     timestamp: datetime
     status: str = "active"
     size: Optional[str] = None
+    normalization_strategy: Optional[str] = None
+    normalized_text_hash: Optional[str] = None
+    zk_commitment: Optional[str] = None
+    checksum: Optional[str] = None
+    signature: Optional[str] = None
+    qr_payload: Optional[str] = None
+    qr_png_base64: Optional[str] = None
 
 class DocumentResponse(BaseModel):
     id: str
@@ -67,3 +74,28 @@ class DocumentResponse(BaseModel):
     timestamp: str
     status: str
     size: Optional[str] = None
+    zk_commitment: Optional[str] = None
+    checksum: Optional[str] = None
+
+
+class DocumentVerificationPayload(BaseModel):
+    id: str
+    file_hash: str
+    issued_at: str
+    normalization_strategy: str
+    zk_commitment: str
+    checksum: str
+    signature: str
+    qr_payload: str
+    qr_png_base64: str
+
+
+class SchnorrProof(BaseModel):
+    rx: str
+    ry: str
+    s: str
+
+
+class ProofVerificationRequest(BaseModel):
+    proof: SchnorrProof
+    context: Optional[str] = ""
