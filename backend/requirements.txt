@@ -26,3 +26,7 @@ starlette==0.14.2
 requests==2.26.0
 uuid==1.30
 python-multipart
+qrcode==7.4.2
+Pillow==10.4.0
+pypdf==3.17.1
+ecdsa==0.18.0
